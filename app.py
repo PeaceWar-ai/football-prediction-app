@@ -1,11 +1,27 @@
-"""
-Football Prediction Platform
-----------------------------
 
-Streamlit + Football-Data.org API v4
+import math
+import os
+from datetime import date, datetime, timedelta
 
-Supported competitions:
-    LEAGUES = {
+import pandas as pd
+import requests
+import streamlit as st
+
+
+# ============================================================
+# APP CONFIGURATION
+# ============================================================
+
+st.set_page_config(
+    page_title="Football Prediction Centre",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+API_BASE_URL = "https://api.football-data.org/v4"
+
+LEAGUES = {
     "Premier League": "PL",
     "Championship": "ELC",
     "La Liga": "PD",
@@ -17,132 +33,48 @@ Supported competitions:
     "UEFA Champions League": "CL",
     "Brasileirão Série A": "BSA",
     "Euro Championship": "EC",
-    "FIFA World Cup": "WC"
+    "FIFA World Cup": "WC",
 }
 
+# Maximum goals considered in the Poisson score matrix.
+MAX_GOALS = 10
 
-Model:
-    - Recent home/away performance
-    - League scoring baseline
-    - Attack/defence strength
-    - Poisson goal model
-    - Scoreline probability matrix
+# Minimum historical matches required before a team-specific
+# estimate is considered reasonably established.
+MIN_TEAM_MATCHES = 3
 
-Markets:
-    - Home / Draw / Away
-    - Double Chance
-    - Draw No Bet
-    - Over / Under 0.5, 1.5, 2.5, 3.5, 4.5
-    - BTTS Yes / No
-    - Home team goal totals
-    - Away team goal totals
-    - BTTS + Result
-    - Correct Score
-
-Backtesting:
-    - 1X2 accuracy
-    - Brier score
-    - Log loss
-    - Market accuracy
-    - Historical prediction tracking
-
-IMPORTANT:
-    This application produces statistical estimates.
-    It does not guarantee betting outcomes.
-"""
-
-import os
-import math
-import json
-from pathlib import Path
-from datetime import datetime, timedelta, timezone
-
-import numpy as np
-import pandas as pd
-import requests
-import streamlit as st
-from scipy.stats import poisson
-import plotly.express as px
-import plotly.graph_objects as go
+# Prediction history is kept in Streamlit session state.
+HISTORY_KEY = "prediction_history"
 
 
 # ============================================================
-# APP CONFIGURATION
-# ============================================================
-
-st.set_page_config(
-    page_title="Football Prediction Platform",
-    page_icon="⚽",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-API_BASE = "https://api.football-data.org/v4"
-
-COMPETITIONS = {
-    "Premier League": "PL",
-    "La Liga": "PD",
-    "Serie A": "SA",
-}
-
-HISTORY_FILE = Path("prediction_history.csv")
-
-DEFAULT_HISTORY_MATCHES = 10
-DEFAULT_FIXTURE_DAYS = 14
-DEFAULT_MAX_GOALS = 7
-DEFAULT_MIN_HISTORY = 5
-
-REQUEST_TIMEOUT = 20
-
-
-# ============================================================
-# CUSTOM CSS
+# STYLING
 # ============================================================
 
 st.markdown(
     """
     <style>
-        .main-title {
-            font-size: 2.5rem;
-            font-weight: 800;
-            margin-bottom: 0.2rem;
-        }
+    .main {
+        background-color: #f7f9fc;
+    }
 
-        .subtitle {
-            color: #777;
-            margin-bottom: 1.5rem;
-        }
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+    }
 
-        .metric-card {
-            padding: 1rem;
-            border-radius: 12px;
-            border: 1px solid rgba(128,128,128,0.25);
-            background: rgba(128,128,128,0.06);
-        }
+    .metric-card {
+        background: white;
+        padding: 18px;
+        border-radius: 12px;
+        border: 1px solid #e7eaf0;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
 
-        .prediction-box {
-            padding: 1rem;
-            border-radius: 12px;
-            border: 1px solid rgba(128,128,128,0.25);
-            margin-bottom: 0.7rem;
-        }
-
-        .warning-box {
-            padding: 1rem;
-            border-radius: 10px;
-            background: rgba(255,193,7,0.10);
-            border: 1px solid rgba(255,193,7,0.35);
-        }
-
-        .small-text {
-            font-size: 0.85rem;
-            color: #777;
-        }
+    .small-note {
+        color: #6b7280;
+        font-size: 0.88rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -150,130 +82,76 @@ st.markdown(
 
 
 # ============================================================
-# API KEY
-# ============================================================
-
-def get_api_key():
-    """
-    Gets API key from Streamlit secrets first.
-    Falls back to environment variable.
-    Finally allows sidebar entry for local testing.
-    """
-
-    secret_key = None
-
-    try:
-        secret_key = st.secrets.get("FOOTBALL_DATA_API_KEY")
-    except Exception:
-        secret_key = None
-
-    if secret_key:
-        return secret_key
-
-    env_key = os.getenv("FOOTBALL_DATA_API_KEY")
-
-    if env_key:
-        return env_key
-
-    return st.sidebar.text_input(
-        "Football-Data.org API Key",
-        type="password",
-        help="For GitHub/Streamlit Cloud, store this as FOOTBALL_DATA_API_KEY in Streamlit secrets.",
-    )
-
-
-# ============================================================
-# API REQUEST HELPER
-# ============================================================
-
-def api_get(endpoint, params=None, api_key=None):
-    """
-    Central API request function.
-    """
-
-    if not api_key:
-        raise ValueError("Football-Data.org API key is missing.")
-
-    url = f"{API_BASE}{endpoint}"
-
-    headers = {
-        "X-Auth-Token": api_key,
-        "Accept": "application/json",
-    }
-
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Network error while contacting Football-Data.org: {exc}")
-
-    if response.status_code == 429:
-        reset_seconds = response.headers.get(
-            "X-RequestCounter-Reset",
-            "unknown",
-        )
-
-        raise RuntimeError(
-            f"Football-Data.org rate limit reached. "
-            f"Try again later. Reset information: {reset_seconds}."
-        )
-
-    if response.status_code == 401:
-        raise RuntimeError(
-            "The Football-Data.org API key was rejected. "
-            "Check that the token is correct."
-        )
-
-    if response.status_code == 403:
-        raise RuntimeError(
-            "Football-Data.org restricted this resource for your API plan."
-        )
-
-    if response.status_code >= 400:
-        try:
-            error_data = response.json()
-            error_message = error_data.get("message") or error_data.get("error")
-        except Exception:
-            error_message = response.text
-
-        raise RuntimeError(
-            f"Football-Data.org returned HTTP {response.status_code}: "
-            f"{error_message}"
-        )
-
-    try:
-        return response.json()
-    except ValueError:
-        raise RuntimeError("Football-Data.org returned an invalid JSON response.")
-
-
-# ============================================================
 # API FUNCTIONS
 # ============================================================
 
-@st.cache_data(ttl=900, show_spinner=False)
-def get_competition_matches(
-    competition_code,
-    api_key,
-    season=None,
-    date_from=None,
-    date_to=None,
-    status=None,
-):
-    """
-    Retrieve competition matches.
+def get_api_token():
+    """Read the API token from Streamlit secrets or environment."""
 
-    Cached for 15 minutes to reduce API requests.
-    """
+    try:
+        token = st.secrets.get("FOOTBALL_DATA_TOKEN", "")
+    except Exception:
+        token = ""
+
+    if not token:
+        token = os.getenv("FOOTBALL_DATA_TOKEN", "")
+
+    return token.strip() if token else ""
+
+
+def api_get(endpoint, token, params=None):
+    """Send a request to Football-Data.org and return JSON."""
+
+    if not token:
+        raise ValueError("API token is missing.")
+
+    url = f"{API_BASE_URL}/{endpoint.lstrip('/')}"
+
+    headers = {
+        "X-Auth-Token": token,
+        "Accept": "application/json",
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        params=params,
+        timeout=25,
+    )
+
+    if response.status_code == 401:
+        raise ValueError("Invalid API token. Check your Football-Data.org token.")
+
+    if response.status_code == 403:
+        raise ValueError(
+            "Your current API plan does not provide access to this competition "
+            "or endpoint."
+        )
+
+    if response.status_code == 404:
+        raise ValueError(
+            "The requested competition or data endpoint was not found."
+        )
+
+    if response.status_code == 429:
+        raise ValueError(
+            "API rate limit reached. Please wait before refreshing."
+        )
+
+    if response.status_code >= 400:
+        raise ValueError(
+            f"API request failed with status {response.status_code}: "
+            f"{response.text[:250]}"
+        )
+
+    return response.json()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_competition_matches(competition_code, token, date_from=None, date_to=None):
+    """Fetch matches for a competition."""
 
     params = {}
-
-    if season:
-        params["season"] = season
 
     if date_from:
         params["dateFrom"] = date_from
@@ -281,2284 +159,1186 @@ def get_competition_matches(
     if date_to:
         params["dateTo"] = date_to
 
-    if status:
-        params["status"] = status
-
     data = api_get(
-        f"/competitions/{competition_code}/matches",
+        f"competitions/{competition_code}/matches",
+        token,
         params=params,
-        api_key=api_key,
-    )
-
-    matches = data.get("matches", [])
-
-    return matches
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_competition_info(competition_code, api_key):
-    """
-    Retrieve competition metadata.
-    """
-
-    return api_get(
-        f"/competitions/{competition_code}",
-        api_key=api_key,
-    )
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_team_matches(
-    team_id,
-    api_key,
-    season=None,
-    competition_code=None,
-    status="FINISHED",
-):
-    """
-    Retrieve matches for a team.
-    """
-
-    params = {
-        "status": status,
-        "limit": 100,
-    }
-
-    if season:
-        params["season"] = season
-
-    if competition_code:
-        params["competitions"] = competition_code
-
-    data = api_get(
-        f"/teams/{team_id}/matches/",
-        params=params,
-        api_key=api_key,
     )
 
     return data.get("matches", [])
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def get_match_by_id(match_id, api_key):
-    """
-    Retrieve a specific match.
-    """
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_competition_standings(competition_code, token):
+    """Fetch standings when supported by the competition."""
 
-    return api_get(
-        f"/matches/{match_id}",
-        api_key=api_key,
+    data = api_get(
+        f"competitions/{competition_code}/standings",
+        token,
     )
 
+    return data.get("standings", [])
+
 
 # ============================================================
-# DATA HELPERS
+# DATA PROCESSING
 # ============================================================
 
-def safe_int(value, default=0):
-    try:
-        return int(value)
-    except Exception:
-        return default
+def match_to_record(match, league_name):
+    """Convert an API match object into a consistent dictionary."""
+
+    home = match.get("homeTeam") or {}
+    away = match.get("awayTeam") or {}
+    score = match.get("score") or {}
+    full_time = score.get("fullTime") or {}
+
+    return {
+        "match_id": match.get("id"),
+        "league": league_name,
+        "competition_code": match.get("competition", {}).get("code"),
+        "utc_date": match.get("utcDate"),
+        "date": match.get("utcDate", "")[:10],
+        "status": match.get("status"),
+        "matchday": match.get("matchday"),
+        "home_team": home.get("name", "Unknown"),
+        "away_team": away.get("name", "Unknown"),
+        "home_score": full_time.get("home"),
+        "away_score": full_time.get("away"),
+        "winner": score.get("winner"),
+    }
 
 
-def safe_float(value, default=0.0):
-    try:
-        return float(value)
-    except Exception:
-        return default
+def records_to_dataframe(matches, league_name):
+    """Convert a list of API matches to a DataFrame."""
+
+    records = [
+        match_to_record(match, league_name)
+        for match in matches
+    ]
+
+    return pd.DataFrame(records)
 
 
-def parse_match_date(match):
+def get_finished_matches(df):
+    """Return matches with valid full-time scores."""
+
+    if df.empty:
+        return df.copy()
+
+    finished = df[
+        (df["status"] == "FINISHED")
+        & df["home_score"].notna()
+        & df["away_score"].notna()
+    ].copy()
+
+    if not finished.empty:
+        finished["home_score"] = finished["home_score"].astype(int)
+        finished["away_score"] = finished["away_score"].astype(int)
+
+    return finished
+
+
+def get_upcoming_matches(df):
+    """Return scheduled matches."""
+
+    if df.empty:
+        return df.copy()
+
+    return df[
+        df["status"].isin(["SCHEDULED", "TIMED"])
+    ].copy()
+
+
+# ============================================================
+# TEAM STATISTICS
+# ============================================================
+
+def calculate_team_stats(matches, team_name, before_date=None):
     """
-    Convert UTC match date to pandas Timestamp.
+    Calculate a team's scoring and conceding rates.
+
+    Only matches earlier than before_date are used when supplied.
     """
 
-    value = match.get("utcDate")
-
-    if not value:
-        return pd.NaT
-
-    try:
-        return pd.to_datetime(value, utc=True)
-    except Exception:
-        return pd.NaT
-
-
-def get_full_time_score(match):
-    """
-    Return home and away full-time scores.
-
-    Returns None if the match does not have a completed score.
-    """
-
-    score = match.get("score", {})
-    full_time = score.get("fullTime", {})
-
-    home = full_time.get("home")
-    away = full_time.get("away")
-
-    if home is None or away is None:
+    if matches.empty:
         return None
 
-    return safe_int(home), safe_int(away)
+    team_matches = matches[
+        (matches["home_team"] == team_name)
+        | (matches["away_team"] == team_name)
+    ].copy()
+
+    if before_date is not None:
+        before_date = pd.to_datetime(before_date, utc=True)
+
+        team_matches["_datetime"] = pd.to_datetime(
+            team_matches["utc_date"],
+            utc=True,
+            errors="coerce",
+        )
+
+        team_matches = team_matches[
+            team_matches["_datetime"] < before_date
+        ]
+
+    if team_matches.empty:
+        return None
+
+    goals_for = []
+    goals_against = []
+    home_games = 0
+    away_games = 0
+    wins = 0
+    draws = 0
+    losses = 0
+
+    for _, match in team_matches.iterrows():
+        if match["home_team"] == team_name:
+            scored = int(match["home_score"])
+            conceded = int(match["away_score"])
+            home_games += 1
+        else:
+            scored = int(match["away_score"])
+            conceded = int(match["home_score"])
+            away_games += 1
+
+        goals_for.append(scored)
+        goals_against.append(conceded)
+
+        if scored > conceded:
+            wins += 1
+        elif scored == conceded:
+            draws += 1
+        else:
+            losses += 1
+
+    games = len(goals_for)
+
+    return {
+        "team": team_name,
+        "played": games,
+        "home_games": home_games,
+        "away_games": away_games,
+        "goals_for": sum(goals_for),
+        "goals_against": sum(goals_against),
+        "goals_for_per_game": sum(goals_for) / games,
+        "goals_against_per_game": sum(goals_against) / games,
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "points": wins * 3 + draws,
+    }
 
 
-def is_finished(match):
-    """
-    Determine whether a match has a usable final score.
-    """
+def calculate_league_baseline(matches, before_date=None):
+    """Calculate average home and away goals for a competition."""
 
-    status = match.get("status")
+    if matches.empty:
+        return 1.35, 1.10
 
-    if status == "FINISHED":
-        return get_full_time_score(match) is not None
+    data = matches.copy()
 
-    return False
+    if before_date is not None:
+        before_date = pd.to_datetime(before_date, utc=True)
+
+        data["_datetime"] = pd.to_datetime(
+            data["utc_date"],
+            utc=True,
+            errors="coerce",
+        )
+
+        data = data[data["_datetime"] < before_date]
+
+    if data.empty:
+        return 1.35, 1.10
+
+    home_average = data["home_score"].mean()
+    away_average = data["away_score"].mean()
+
+    if pd.isna(home_average) or home_average <= 0:
+        home_average = 1.35
+
+    if pd.isna(away_average) or away_average <= 0:
+        away_average = 1.10
+
+    return float(home_average), float(away_average)
 
 
-def match_team_names(match):
-    home = match.get("homeTeam", {})
-    away = match.get("awayTeam", {})
+# ============================================================
+# POISSON PREDICTION ENGINE
+# ============================================================
+
+def poisson_probability(goals, expected_goals):
+    """Calculate the probability of scoring exactly N goals."""
+
+    expected_goals = max(0.01, float(expected_goals))
 
     return (
-        home.get("name", "Unknown"),
-        away.get("name", "Unknown"),
+        math.exp(-expected_goals)
+        * expected_goals ** goals
+        / math.factorial(goals)
     )
 
-
-# ============================================================
-# TEAM HISTORY
-# ============================================================
-
-def extract_team_history(
-    matches,
-    team_id,
-    before_date=None,
-    limit=10,
-):
-    """
-    Extract only the team's completed matches occurring
-    before the target fixture.
-
-    This is important for avoiding future-data leakage.
-    """
-
-    records = []
-
-    for match in matches:
-
-        if not is_finished(match):
-            continue
-
-        match_date = parse_match_date(match)
-
-        if pd.isna(match_date):
-            continue
-
-        if before_date is not None and match_date >= before_date:
-            continue
-
-        home_team = match.get("homeTeam", {})
-        away_team = match.get("awayTeam", {})
-
-        home_id = home_team.get("id")
-        away_id = away_team.get("id")
-
-        score = get_full_time_score(match)
-
-        if score is None:
-            continue
-
-        home_goals, away_goals = score
-
-        if home_id == team_id:
-
-            records.append(
-                {
-                    "date": match_date,
-                    "home_team": home_team.get("name"),
-                    "away_team": away_team.get("name"),
-                    "goals_for": home_goals,
-                    "goals_against": away_goals,
-                    "venue": "HOME",
-                    "result": (
-                        "W"
-                        if home_goals > away_goals
-                        else "D"
-                        if home_goals == away_goals
-                        else "L"
-                    ),
-                }
-            )
-
-        elif away_id == team_id:
-
-            records.append(
-                {
-                    "date": match_date,
-                    "home_team": home_team.get("name"),
-                    "away_team": away_team.get("name"),
-                    "goals_for": away_goals,
-                    "goals_against": home_goals,
-                    "venue": "AWAY",
-                    "result": (
-                        "W"
-                        if away_goals > home_goals
-                        else "D"
-                        if home_goals == away_goals
-                        else "L"
-                    ),
-                }
-            )
-
-    records = sorted(
-        records,
-        key=lambda x: x["date"],
-        reverse=True,
-    )
-
-    return records[:limit]
-
-
-# ============================================================
-# STATISTICS
-# ============================================================
-
-def calculate_average(records, key):
-    if not records:
-        return 0.0
-
-    values = [safe_float(record.get(key)) for record in records]
-
-    return float(np.mean(values))
-
-
-def calculate_weighted_average(records, key):
-    """
-    More recent matches receive greater weight.
-
-    Most recent match has the highest weight.
-    """
-
-    if not records:
-        return 0.0
-
-    values = np.array(
-        [safe_float(record.get(key)) for record in records],
-        dtype=float,
-    )
-
-    weights = np.arange(
-        len(values),
-        0,
-        -1,
-        dtype=float,
-    )
-
-    return float(np.average(values, weights=weights))
-
-
-def calculate_team_stats(history):
-    """
-    Calculate basic form statistics.
-    """
-
-    if not history:
-        return {
-            "matches": 0,
-            "goals_for": 0.0,
-            "goals_against": 0.0,
-            "win_rate": 0.0,
-            "draw_rate": 0.0,
-            "loss_rate": 0.0,
-        }
-
-    results = [r["result"] for r in history]
-
-    return {
-        "matches": len(history),
-        "goals_for": calculate_weighted_average(
-            history,
-            "goals_for",
-        ),
-        "goals_against": calculate_weighted_average(
-            history,
-            "goals_against",
-        ),
-        "win_rate": results.count("W") / len(results),
-        "draw_rate": results.count("D") / len(results),
-        "loss_rate": results.count("L") / len(results),
-    }
-
-
-# ============================================================
-# LEAGUE BASELINES
-# ============================================================
-
-def calculate_league_baseline(
-    completed_matches,
-):
-    """
-    Calculate league-wide average goals.
-
-    Used as a baseline so the model isn't based only
-    on two teams' raw averages.
-    """
-
-    rows = []
-
-    for match in completed_matches:
-
-        score = get_full_time_score(match)
-
-        if score is None:
-            continue
-
-        home_goals, away_goals = score
-
-        rows.append(
-            {
-                "home_goals": home_goals,
-                "away_goals": away_goals,
-            }
-        )
-
-    if not rows:
-        return {
-            "home_goals": 1.40,
-            "away_goals": 1.10,
-            "total_goals": 2.50,
-        }
-
-    df = pd.DataFrame(rows)
-
-    home_average = df["home_goals"].mean()
-    away_average = df["away_goals"].mean()
-
-    return {
-        "home_goals": float(home_average),
-        "away_goals": float(away_average),
-        "total_goals": float(
-            home_average + away_average
-        ),
-    }
-
-
-# ============================================================
-# EXPECTED GOALS MODEL
-# ============================================================
 
 def calculate_expected_goals(
-    home_history,
-    away_history,
-    league_baseline,
+    home_stats,
+    away_stats,
+    league_home_average,
+    league_away_average,
 ):
     """
-    Calculate expected goals.
+    Estimate expected goals using attack and defence strengths.
 
-    The model combines:
-
-        - team's recent scoring
-        - team's recent conceding
-        - league baseline
-        - venue-specific information
-        - smoothing
-
-    It is deliberately transparent rather than a black box.
+    The calculation blends team-specific performance with league
+    averages to reduce extreme estimates from small samples.
     """
 
-    league_home = league_baseline["home_goals"]
-    league_away = league_baseline["away_goals"]
+    if home_stats is None or away_stats is None:
+        return league_home_average, league_away_average
 
-    if not home_history:
-        home_attack = league_home
-        home_defence = league_away
-    else:
-        home_home_games = [
-            x for x in home_history
-            if x["venue"] == "HOME"
-        ]
-
-        if not home_home_games:
-            home_home_games = home_history
-
-        home_attack = calculate_weighted_average(
-            home_home_games,
-            "goals_for",
-        )
-
-        home_defence = calculate_weighted_average(
-            home_home_games,
-            "goals_against",
-        )
-
-    if not away_history:
-        away_attack = league_away
-        away_defence = league_home
-    else:
-        away_away_games = [
-            x for x in away_history
-            if x["venue"] == "AWAY"
-        ]
-
-        if not away_away_games:
-            away_away_games = away_history
-
-        away_attack = calculate_weighted_average(
-            away_away_games,
-            "goals_for",
-        )
-
-        away_defence = calculate_weighted_average(
-            away_away_games,
-            "goals_against",
-        )
-
-    # --------------------------------------------------------
-    # Attack / defence blend
-    # --------------------------------------------------------
-
-    raw_home_xg = (
-        (home_attack * 0.60)
-        + (away_defence * 0.40)
+    # League averages are used as a stabilising baseline.
+    home_attack = (
+        home_stats["goals_for_per_game"] / max(0.1, league_home_average)
     )
 
-    raw_away_xg = (
-        (away_attack * 0.60)
-        + (home_defence * 0.40)
+    home_defence = (
+        home_stats["goals_against_per_game"] / max(0.1, league_away_average)
     )
 
-    # --------------------------------------------------------
-    # League smoothing
-    # --------------------------------------------------------
-
-    home_xg = (
-        raw_home_xg * 0.75
-        + league_home * 0.25
+    away_attack = (
+        away_stats["goals_for_per_game"] / max(0.1, league_away_average)
     )
 
-    away_xg = (
-        raw_away_xg * 0.75
-        + league_away * 0.25
+    away_defence = (
+        away_stats["goals_against_per_game"] / max(0.1, league_home_average)
     )
 
-    # Prevent unrealistic values.
-    home_xg = float(
-        np.clip(home_xg, 0.15, 4.50)
-    )
+    # Keep estimates within a practical range.
+    expected_home = league_home_average * home_attack * away_defence
+    expected_away = league_away_average * away_attack * home_defence
 
-    away_xg = float(
-        np.clip(away_xg, 0.15, 4.50)
-    )
+    expected_home = max(0.15, min(expected_home, 4.5))
+    expected_away = max(0.15, min(expected_away, 4.5))
 
-    return home_xg, away_xg
+    return expected_home, expected_away
 
 
-# ============================================================
-# POISSON MODEL
-# ============================================================
+def create_score_matrix(expected_home, expected_away, max_goals=MAX_GOALS):
+    """Create a matrix of exact score probabilities."""
 
-def poisson_score_matrix(
-    home_xg,
-    away_xg,
-    max_goals=7,
-):
-    """
-    Generate probability of every scoreline.
-    """
+    home_probs = [
+        poisson_probability(i, expected_home)
+        for i in range(max_goals + 1)
+    ]
 
-    home_probs = poisson.pmf(
-        np.arange(max_goals + 1),
-        home_xg,
-    )
+    away_probs = [
+        poisson_probability(i, expected_away)
+        for i in range(max_goals + 1)
+    ]
 
-    away_probs = poisson.pmf(
-        np.arange(max_goals + 1),
-        away_xg,
-    )
+    matrix = []
 
-    matrix = np.outer(
-        home_probs,
-        away_probs,
-    )
+    for home_goals in range(max_goals + 1):
+        row = []
 
-    # Normalize because scorelines above max_goals
-    # have been truncated.
-    total = matrix.sum()
+        for away_goals in range(max_goals + 1):
+            row.append(
+                home_probs[home_goals] * away_probs[away_goals]
+            )
+
+        matrix.append(row)
+
+    # Normalise to account for probability beyond the matrix boundary.
+    total = sum(sum(row) for row in matrix)
 
     if total > 0:
-        matrix = matrix / total
+        matrix = [
+            [probability / total for probability in row]
+            for row in matrix
+        ]
 
     return matrix
 
 
-# ============================================================
-# MARKET CALCULATIONS
-# ============================================================
-
-def calculate_markets(
-    matrix,
-    max_goals=7,
-):
-    """
-    Convert scoreline probabilities into market probabilities.
-    """
-
-    markets = {}
+def analyse_score_matrix(matrix):
+    """Calculate 1X2, goals, BTTS and most likely score markets."""
 
     home_win = 0.0
     draw = 0.0
     away_win = 0.0
-
-    btts_yes = 0.0
-
-    over_05 = 0.0
     over_15 = 0.0
     over_25 = 0.0
     over_35 = 0.0
-    over_45 = 0.0
+    under_25 = 0.0
+    btts_yes = 0.0
+    btts_no = 0.0
 
-    home_over_05 = 0.0
-    home_over_15 = 0.0
-    home_over_25 = 0.0
+    best_score = (0, 0)
+    best_probability = 0.0
 
-    away_over_05 = 0.0
-    away_over_15 = 0.0
-    away_over_25 = 0.0
-
-    correct_scores = []
-
-    for home_goals in range(max_goals + 1):
-
-        for away_goals in range(max_goals + 1):
-
-            probability = float(
-                matrix[home_goals, away_goals]
-            )
-
-            total_goals = home_goals + away_goals
+    for home_goals, row in enumerate(matrix):
+        for away_goals, probability in enumerate(row):
 
             if home_goals > away_goals:
                 home_win += probability
-
             elif home_goals == away_goals:
                 draw += probability
-
             else:
                 away_win += probability
 
-            if home_goals > 0 and away_goals > 0:
-                btts_yes += probability
+            total_goals = home_goals + away_goals
 
-            if total_goals > 0:
-                over_05 += probability
-
-            if total_goals > 1:
+            if total_goals >= 2:
                 over_15 += probability
 
-            if total_goals > 2:
+            if total_goals >= 3:
                 over_25 += probability
+            else:
+                under_25 += probability
 
-            if total_goals > 3:
+            if total_goals >= 4:
                 over_35 += probability
 
-            if total_goals > 4:
-                over_45 += probability
-
-            if home_goals > 0:
-                home_over_05 += probability
-
-            if home_goals > 1:
-                home_over_15 += probability
-
-            if home_goals > 2:
-                home_over_25 += probability
-
-            if away_goals > 0:
-                away_over_05 += probability
-
-            if away_goals > 1:
-                away_over_15 += probability
-
-            if away_goals > 2:
-                away_over_25 += probability
-
-            correct_scores.append(
-                {
-                    "score": f"{home_goals}-{away_goals}",
-                    "probability": probability,
-                }
-            )
-
-    markets["Home Win"] = home_win
-    markets["Draw"] = draw
-    markets["Away Win"] = away_win
-
-    markets["1X"] = home_win + draw
-    markets["12"] = home_win + away_win
-    markets["X2"] = draw + away_win
-
-    # Draw No Bet probabilities
-    # These represent the probability of the team winning
-    # among non-draw outcomes.
-    non_draw = home_win + away_win
-
-    if non_draw > 0:
-        markets["Home DNB"] = home_win / non_draw
-        markets["Away DNB"] = away_win / non_draw
-    else:
-        markets["Home DNB"] = 0.0
-        markets["Away DNB"] = 0.0
-
-    markets["Over 0.5"] = over_05
-    markets["Under 0.5"] = 1 - over_05
-
-    markets["Over 1.5"] = over_15
-    markets["Under 1.5"] = 1 - over_15
-
-    markets["Over 2.5"] = over_25
-    markets["Under 2.5"] = 1 - over_25
-
-    markets["Over 3.5"] = over_35
-    markets["Under 3.5"] = 1 - over_35
-
-    markets["Over 4.5"] = over_45
-    markets["Under 4.5"] = 1 - over_45
-
-    markets["BTTS Yes"] = btts_yes
-    markets["BTTS No"] = 1 - btts_yes
-
-    markets["Home Over 0.5"] = home_over_05
-    markets["Home Under 0.5"] = 1 - home_over_05
-
-    markets["Home Over 1.5"] = home_over_15
-    markets["Home Under 1.5"] = 1 - home_over_15
-
-    markets["Home Over 2.5"] = home_over_25
-    markets["Home Under 2.5"] = 1 - home_over_25
-
-    markets["Away Over 0.5"] = away_over_05
-    markets["Away Under 0.5"] = 1 - away_over_05
-
-    markets["Away Over 1.5"] = away_over_15
-    markets["Away Under 1.5"] = 1 - away_over_15
-
-    markets["Away Over 2.5"] = away_over_25
-    markets["Away Under 2.5"] = 1 - away_over_25
-
-    # --------------------------------------------------------
-    # BTTS + Result
-    # --------------------------------------------------------
-
-    home_btts = 0.0
-    draw_btts = 0.0
-    away_btts = 0.0
-
-    for home_goals in range(max_goals + 1):
-
-        for away_goals in range(max_goals + 1):
-
-            probability = float(
-                matrix[home_goals, away_goals]
-            )
-
             if home_goals > 0 and away_goals > 0:
+                btts_yes += probability
+            else:
+                btts_no += probability
 
-                if home_goals > away_goals:
-                    home_btts += probability
-
-                elif home_goals == away_goals:
-                    draw_btts += probability
-
-                else:
-                    away_btts += probability
-
-    markets["Home Win + BTTS"] = home_btts
-    markets["Draw + BTTS"] = draw_btts
-    markets["Away Win + BTTS"] = away_btts
-
-    # --------------------------------------------------------
-    # Correct scores
-    # --------------------------------------------------------
-
-    correct_scores = sorted(
-        correct_scores,
-        key=lambda x: x["probability"],
-        reverse=True,
-    )
-
-    markets["_correct_scores"] = correct_scores
-
-    return markets
-
-
-# ============================================================
-# PREDICTION SELECTION
-# ============================================================
-
-PREFERRED_MARKETS = [
-    "Home Win",
-    "Draw",
-    "Away Win",
-    "1X",
-    "12",
-    "X2",
-    "Over 1.5",
-    "Under 1.5",
-    "Over 2.5",
-    "Under 2.5",
-    "Over 3.5",
-    "Under 3.5",
-    "BTTS Yes",
-    "BTTS No",
-    "Home DNB",
-    "Away DNB",
-]
-
-
-def select_best_prediction(
-    markets,
-    minimum_probability=0.60,
-):
-    """
-    Select the highest-probability supported market
-    above the configured threshold.
-
-    This is a model selection, not a recommendation
-    or guarantee.
-    """
-
-    candidates = []
-
-    for market in PREFERRED_MARKETS:
-
-        probability = markets.get(market)
-
-        if probability is None:
-            continue
-
-        candidates.append(
-            (
-                market,
-                float(probability),
-            )
-        )
-
-    candidates.sort(
-        key=lambda x: x[1],
-        reverse=True,
-    )
-
-    if not candidates:
-        return None, 0.0
-
-    best_market, best_probability = candidates[0]
-
-    if best_probability >= minimum_probability:
-        return best_market, best_probability
-
-    return "No threshold selection", best_probability
-
-
-def confidence_label(probability):
-    if probability >= 0.80:
-        return "Very High"
-    elif probability >= 0.70:
-        return "High"
-    elif probability >= 0.60:
-        return "Moderate"
-    elif probability >= 0.50:
-        return "Low"
-    return "Very Low"
-
-
-# ============================================================
-# COMPLETE MATCH PREDICTION
-# ============================================================
-
-def predict_match(
-    match,
-    all_completed_matches,
-    history_matches=10,
-    max_goals=7,
-    minimum_probability=0.60,
-):
-    """
-    Generate a complete prediction for one fixture.
-    """
-
-    home_team = match.get("homeTeam", {})
-    away_team = match.get("awayTeam", {})
-
-    home_id = home_team.get("id")
-    away_id = away_team.get("id")
-
-    home_name = home_team.get(
-        "name",
-        "Unknown Home Team",
-    )
-
-    away_name = away_team.get(
-        "name",
-        "Unknown Away Team",
-    )
-
-    match_date = parse_match_date(match)
-
-    # --------------------------------------------------------
-    # Historical form
-    # --------------------------------------------------------
-
-    home_history = extract_team_history(
-        all_completed_matches,
-        home_id,
-        before_date=match_date,
-        limit=history_matches,
-    )
-
-    away_history = extract_team_history(
-        all_completed_matches,
-        away_id,
-        before_date=match_date,
-        limit=history_matches,
-    )
-
-    league_baseline = calculate_league_baseline(
-        [
-            m for m in all_completed_matches
-            if parse_match_date(m) < match_date
-            and is_finished(m)
-        ]
-    )
-
-    # --------------------------------------------------------
-    # Expected goals
-    # --------------------------------------------------------
-
-    home_xg, away_xg = calculate_expected_goals(
-        home_history,
-        away_history,
-        league_baseline,
-    )
-
-    # --------------------------------------------------------
-    # Poisson matrix
-    # --------------------------------------------------------
-
-    matrix = poisson_score_matrix(
-        home_xg,
-        away_xg,
-        max_goals=max_goals,
-    )
-
-    # --------------------------------------------------------
-    # Markets
-    # --------------------------------------------------------
-
-    markets = calculate_markets(
-        matrix,
-        max_goals=max_goals,
-    )
-
-    best_market, best_probability = select_best_prediction(
-        markets,
-        minimum_probability=minimum_probability,
-    )
-
-    correct_scores = markets.pop(
-        "_correct_scores",
-        [],
-    )
-
-    top_scores = correct_scores[:5]
+            if probability > best_probability:
+                best_probability = probability
+                best_score = (home_goals, away_goals)
 
     return {
-        "match_id": match.get("id"),
-        "competition": match.get(
-            "competition",
-            {},
-        ).get(
-            "name",
-            "Unknown Competition",
-        ),
-        "date": match_date,
-        "home_team": home_name,
-        "away_team": away_name,
-        "home_id": home_id,
-        "away_id": away_id,
-        "home_history": home_history,
-        "away_history": away_history,
-        "home_stats": calculate_team_stats(
-            home_history
-        ),
-        "away_stats": calculate_team_stats(
-            away_history
-        ),
-        "league_baseline": league_baseline,
-        "home_xg": home_xg,
-        "away_xg": away_xg,
-        "matrix": matrix,
-        "markets": markets,
-        "top_scores": top_scores,
-        "best_market": best_market,
-        "best_probability": best_probability,
-        "confidence": confidence_label(
-            best_probability
-        ),
+        "home_win": home_win,
+        "draw": draw,
+        "away_win": away_win,
+        "over_15": over_15,
+        "over_25": over_25,
+        "over_35": over_35,
+        "under_25": under_25,
+        "btts_yes": btts_yes,
+        "btts_no": btts_no,
+        "most_likely_score": best_score,
+        "score_probability": best_probability,
     }
 
 
-# ============================================================
-# RESULT EVALUATION
-# ============================================================
+def predict_match(match, historical_matches):
+    """Generate a prediction for one fixture."""
 
-def actual_market_result(
-    home_goals,
-    away_goals,
-    market,
-):
-    """
-    Determine whether a market was correct.
+    home_team = match["home_team"]
+    away_team = match["away_team"]
+    kickoff = match.get("utc_date")
 
-    Returns:
-        True / False
-    """
-
-    total = home_goals + away_goals
-
-    if market == "Home Win":
-        return home_goals > away_goals
-
-    if market == "Draw":
-        return home_goals == away_goals
-
-    if market == "Away Win":
-        return away_goals > home_goals
-
-    if market == "1X":
-        return home_goals >= away_goals
-
-    if market == "12":
-        return home_goals != away_goals
-
-    if market == "X2":
-        return away_goals >= home_goals
-
-    if market == "Over 0.5":
-        return total > 0
-
-    if market == "Under 0.5":
-        return total == 0
-
-    if market == "Over 1.5":
-        return total > 1
-
-    if market == "Under 1.5":
-        return total <= 1
-
-    if market == "Over 2.5":
-        return total > 2
-
-    if market == "Under 2.5":
-        return total <= 2
-
-    if market == "Over 3.5":
-        return total > 3
-
-    if market == "Under 3.5":
-        return total <= 3
-
-    if market == "Over 4.5":
-        return total > 4
-
-    if market == "Under 4.5":
-        return total <= 4
-
-    if market == "BTTS Yes":
-        return (
-            home_goals > 0
-            and away_goals > 0
-        )
-
-    if market == "BTTS No":
-        return (
-            home_goals == 0
-            or away_goals == 0
-        )
-
-    if market == "Home Over 0.5":
-        return home_goals > 0
-
-    if market == "Home Under 0.5":
-        return home_goals == 0
-
-    if market == "Home Over 1.5":
-        return home_goals > 1
-
-    if market == "Home Under 1.5":
-        return home_goals <= 1
-
-    if market == "Home Over 2.5":
-        return home_goals > 2
-
-    if market == "Home Under 2.5":
-        return home_goals <= 2
-
-    if market == "Away Over 0.5":
-        return away_goals > 0
-
-    if market == "Away Under 0.5":
-        return away_goals == 0
-
-    if market == "Away Over 1.5":
-        return away_goals > 1
-
-    if market == "Away Under 1.5":
-        return away_goals <= 1
-
-    if market == "Away Over 2.5":
-        return away_goals > 2
-
-    if market == "Away Under 2.5":
-        return away_goals <= 2
-
-    return None
-
-
-# ============================================================
-# BRIER SCORE
-# ============================================================
-
-def brier_score(predictions, outcomes):
-    """
-    Binary Brier score.
-    Lower is better.
-
-    BS = mean((probability - outcome)^2)
-    """
-
-    if not predictions:
-        return None
-
-    predictions = np.array(predictions)
-    outcomes = np.array(outcomes)
-
-    return float(
-        np.mean(
-            (predictions - outcomes) ** 2
-        )
+    home_stats = calculate_team_stats(
+        historical_matches,
+        home_team,
+        before_date=kickoff,
     )
 
-
-# ============================================================
-# LOG LOSS
-# ============================================================
-
-def log_loss_binary(
-    probabilities,
-    outcomes,
-):
-    """
-    Binary logarithmic loss.
-    Lower is better.
-    """
-
-    if not probabilities:
-        return None
-
-    eps = 1e-15
-
-    probabilities = np.clip(
-        np.array(probabilities),
-        eps,
-        1 - eps,
+    away_stats = calculate_team_stats(
+        historical_matches,
+        away_team,
+        before_date=kickoff,
     )
 
-    outcomes = np.array(outcomes)
-
-    loss = -np.mean(
-        outcomes * np.log(probabilities)
-        + (
-            1 - outcomes
-        )
-        * np.log(1 - probabilities)
+    league_home, league_away = calculate_league_baseline(
+        historical_matches,
+        before_date=kickoff,
     )
 
-    return float(loss)
-
-
-# ============================================================
-# HISTORY FILE
-# ============================================================
-
-def load_prediction_history():
-    if not HISTORY_FILE.exists():
-        return pd.DataFrame()
-
-    try:
-        return pd.read_csv(
-            HISTORY_FILE
-        )
-    except Exception:
-        return pd.DataFrame()
-
-
-def save_prediction_history(rows):
-    """
-    Save prediction records locally.
-    """
-
-    if not rows:
-        return
-
-    new_df = pd.DataFrame(rows)
-
-    existing = load_prediction_history()
-
-    if not existing.empty:
-        combined = pd.concat(
-            [
-                existing,
-                new_df,
-            ],
-            ignore_index=True,
-        )
-    else:
-        combined = new_df
-
-    if "match_id" in combined.columns:
-        combined = combined.drop_duplicates(
-            subset=["match_id"],
-            keep="last",
-        )
-
-    combined.to_csv(
-        HISTORY_FILE,
-        index=False,
+    expected_home, expected_away = calculate_expected_goals(
+        home_stats,
+        away_stats,
+        league_home,
+        league_away,
     )
 
+    matrix = create_score_matrix(
+        expected_home,
+        expected_away,
+    )
 
-def create_prediction_history_row(
-    prediction,
-):
+    markets = analyse_score_matrix(matrix)
+
     return {
-        "saved_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "match_id": match.get("match_id"),
+        "league": match["league"],
+        "date": match["date"],
+        "utc_date": match["utc_date"],
+        "home_team": home_team,
+        "away_team": away_team,
+        "home_expected_goals": expected_home,
+        "away_expected_goals": expected_away,
+        "home_history": home_stats["played"] if home_stats else 0,
+        "away_history": away_stats["played"] if away_stats else 0,
+        **markets,
+    }
 
-        "match_id": prediction["match_id"],
 
-        "competition": prediction[
-            "competition"
-        ],
+# ============================================================
+# PREDICTION FORMATTING
+# ============================================================
 
-        "match_date": (
-            prediction["date"].isoformat()
-            if not pd.isna(prediction["date"])
-            else ""
+def percent(value):
+    return f"{value * 100:.1f}%"
+
+
+def prediction_to_row(prediction):
+    """Convert prediction results to a display-friendly row."""
+
+    home_score, away_score = prediction["most_likely_score"]
+
+    return {
+        "Date": prediction["date"],
+        "League": prediction["league"],
+        "Home Team": prediction["home_team"],
+        "Away Team": prediction["away_team"],
+        "Home Win": percent(prediction["home_win"]),
+        "Draw": percent(prediction["draw"]),
+        "Away Win": percent(prediction["away_win"]),
+        "Over 2.5": percent(prediction["over_25"]),
+        "Under 2.5": percent(prediction["under_25"]),
+        "BTTS Yes": percent(prediction["btts_yes"]),
+        "BTTS No": percent(prediction["btts_no"]),
+        "Expected Goals": (
+            f"{prediction['home_expected_goals']:.2f} - "
+            f"{prediction['away_expected_goals']:.2f}"
         ),
-
-        "home_team": prediction[
-            "home_team"
-        ],
-
-        "away_team": prediction[
-            "away_team"
-        ],
-
-        "home_xg": prediction[
-            "home_xg"
-        ],
-
-        "away_xg": prediction[
-            "away_xg"
-        ],
-
-        "best_market": prediction[
-            "best_market"
-        ],
-
-        "best_probability": prediction[
-            "best_probability"
-        ],
-
-        "confidence": prediction[
-            "confidence"
-        ],
-
-        "actual_home_goals": "",
-
-        "actual_away_goals": "",
-
-        "result_correct": "",
+        "Predicted Score": f"{home_score} - {away_score}",
+        "Home History": prediction["home_history"],
+        "Away History": prediction["away_history"],
     }
 
 
 # ============================================================
-# UPDATE SAVED PREDICTIONS
+# HISTORY AND RESULT TRACKING
 # ============================================================
 
-def update_prediction_results(
-    history_df,
-    api_key,
-):
-    """
-    Automatically check saved prediction matches
-    that should now have completed.
+def initialise_history():
+    if HISTORY_KEY not in st.session_state:
+        st.session_state[HISTORY_KEY] = []
 
-    This uses the Football-Data.org match ID.
-    """
 
-    if history_df.empty:
-        return history_df
+def save_predictions(predictions):
+    """Save predictions without duplicating the same fixture."""
 
-    required_columns = {
-        "match_id",
-        "best_market",
-        "actual_home_goals",
-        "actual_away_goals",
-        "result_correct",
+    initialise_history()
+
+    existing_ids = {
+        item.get("match_id")
+        for item in st.session_state[HISTORY_KEY]
     }
 
-    if not required_columns.issubset(
-        history_df.columns
-    ):
-        return history_df
+    for prediction in predictions:
+        match_id = prediction.get("match_id")
 
-    updated = history_df.copy()
+        if match_id not in existing_ids:
+            saved = prediction.copy()
+            saved["saved_at"] = datetime.now().isoformat()
+            saved["actual_home_score"] = None
+            saved["actual_away_score"] = None
+            saved["result_checked"] = False
 
-    for index, row in updated.iterrows():
+            st.session_state[HISTORY_KEY].append(saved)
+            existing_ids.add(match_id)
 
-        actual_home = row.get(
-            "actual_home_goals"
-        )
 
-        actual_away = row.get(
-            "actual_away_goals"
-        )
+def update_saved_results(all_matches):
+    """Update stored predictions when matches are finished."""
 
-        # Already updated.
+    initialise_history()
+
+    score_lookup = {}
+
+    for _, match in all_matches.iterrows():
         if (
-            pd.notna(actual_home)
-            and str(actual_home).strip() != ""
-            and pd.notna(actual_away)
-            and str(actual_away).strip() != ""
+            match["status"] == "FINISHED"
+            and pd.notna(match["home_score"])
+            and pd.notna(match["away_score"])
+        ):
+            score_lookup[match["match_id"]] = (
+                int(match["home_score"]),
+                int(match["away_score"]),
+            )
+
+    for prediction in st.session_state[HISTORY_KEY]:
+        match_id = prediction.get("match_id")
+
+        if match_id in score_lookup:
+            home_score, away_score = score_lookup[match_id]
+
+            prediction["actual_home_score"] = home_score
+            prediction["actual_away_score"] = away_score
+            prediction["result_checked"] = True
+
+
+def get_prediction_history():
+    initialise_history()
+    return st.session_state[HISTORY_KEY]
+
+
+def calculate_history_accuracy(history):
+    """Calculate accuracy for settled 1X2 predictions."""
+
+    settled = [
+        item for item in history
+        if item.get("result_checked")
+    ]
+
+    if not settled:
+        return None
+
+    correct = 0
+
+    for item in settled:
+        actual_home = item["actual_home_score"]
+        actual_away = item["actual_away_score"]
+
+        if actual_home > actual_away:
+            actual_result = "home"
+        elif actual_home == actual_away:
+            actual_result = "draw"
+        else:
+            actual_result = "away"
+
+        predicted_result = max(
+            [
+                ("home", item["home_win"]),
+                ("draw", item["draw"]),
+                ("away", item["away_win"]),
+            ],
+            key=lambda x: x[1],
+        )[0]
+
+        if predicted_result == actual_result:
+            correct += 1
+
+    return {
+        "settled": len(settled),
+        "correct": correct,
+        "accuracy": correct / len(settled),
+    }
+
+
+# ============================================================
+# BACKTESTING
+# ============================================================
+
+def backtest_matches(matches, minimum_history=5):
+    """
+    Backtest historical matches in chronological order.
+
+    Each prediction uses only matches played before the target match.
+    """
+
+    if matches.empty:
+        return pd.DataFrame()
+
+    data = matches.copy()
+
+    data["_datetime"] = pd.to_datetime(
+        data["utc_date"],
+        utc=True,
+        errors="coerce",
+    )
+
+    data = data.sort_values("_datetime")
+
+    results = []
+
+    for index, match in data.iterrows():
+        kickoff = match["utc_date"]
+
+        prior_matches = data[
+            data["_datetime"] < pd.to_datetime(kickoff, utc=True)
+        ].copy()
+
+        home_history = calculate_team_stats(
+            prior_matches,
+            match["home_team"],
+        )
+
+        away_history = calculate_team_stats(
+            prior_matches,
+            match["away_team"],
+        )
+
+        if (
+            home_history is None
+            or away_history is None
+            or home_history["played"] < minimum_history
+            or away_history["played"] < minimum_history
         ):
             continue
 
-        match_id = row.get(
-            "match_id"
+        record = match.to_dict()
+
+        prediction = predict_match(
+            record,
+            prior_matches,
         )
 
-        if pd.isna(match_id):
-            continue
+        actual_home = int(match["home_score"])
+        actual_away = int(match["away_score"])
 
-        try:
-            match = get_match_by_id(
-                int(match_id),
-                api_key,
-            )
-        except Exception:
-            continue
+        if actual_home > actual_away:
+            actual_result = "home"
+        elif actual_home == actual_away:
+            actual_result = "draw"
+        else:
+            actual_result = "away"
 
-        if not is_finished(match):
-            continue
+        predicted_result = max(
+            [
+                ("home", prediction["home_win"]),
+                ("draw", prediction["draw"]),
+                ("away", prediction["away_win"]),
+            ],
+            key=lambda x: x[1],
+        )[0]
 
-        score = get_full_time_score(
-            match
-        )
+        results.append({
+            "Date": match["date"],
+            "League": match["league"],
+            "Home Team": match["home_team"],
+            "Away Team": match["away_team"],
+            "Actual Score": f"{actual_home} - {actual_away}",
+            "Predicted Score": (
+                f"{prediction['most_likely_score'][0]} - "
+                f"{prediction['most_likely_score'][1]}"
+            ),
+            "Actual Result": actual_result,
+            "Predicted Result": predicted_result,
+            "Correct": actual_result == predicted_result,
+            "Home Probability": prediction["home_win"],
+            "Draw Probability": prediction["draw"],
+            "Away Probability": prediction["away_win"],
+        })
 
-        if score is None:
-            continue
-
-        home_goals, away_goals = score
-
-        market = row.get(
-            "best_market"
-        )
-
-        correct = actual_market_result(
-            home_goals,
-            away_goals,
-            market,
-        )
-
-        updated.at[
-            index,
-            "actual_home_goals",
-        ] = home_goals
-
-        updated.at[
-            index,
-            "actual_away_goals",
-        ] = away_goals
-
-        updated.at[
-            index,
-            "result_correct",
-        ] = (
-            "WIN"
-            if correct
-            else "LOSS"
-        )
-
-    updated.to_csv(
-        HISTORY_FILE,
-        index=False,
-    )
-
-    return updated
+    return pd.DataFrame(results)
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title("⚙️ Settings")
+st.sidebar.title("⚽ Football Prediction Centre")
+st.sidebar.caption("Data-powered match analysis")
 
-api_key = get_api_key()
+token = get_api_token()
+
+if not token:
+    token = st.sidebar.text_input(
+        "Football-Data.org API Token",
+        type="password",
+        help="Your token is used to retrieve football data.",
+    )
+
+st.sidebar.markdown("---")
 
 selected_leagues = st.sidebar.multiselect(
     "Leagues",
-    list(COMPETITIONS.keys()),
-    default=[
-        "Premier League",
-        "La Liga",
-        "Serie A",
-    ],
+    list(LEAGUES.keys()),
+    default=list(LEAGUES.keys()),
+    help="Select the competitions you want to include in your predictions.",
 )
 
-fixture_days = st.sidebar.slider(
-    "Upcoming fixture window (days)",
+st.sidebar.markdown("---")
+
+today = date.today()
+
+date_from = st.sidebar.date_input(
+    "Start date",
+    value=today,
+)
+
+date_to = st.sidebar.date_input(
+    "End date",
+    value=today + timedelta(days=14),
+)
+
+if date_to < date_from:
+    st.sidebar.error("End date must be after the start date.")
+
+st.sidebar.markdown("---")
+
+minimum_history = st.sidebar.slider(
+    "Minimum historical matches for backtesting",
     min_value=1,
-    max_value=30,
-    value=DEFAULT_FIXTURE_DAYS,
+    max_value=15,
+    value=5,
 )
 
-history_matches = st.sidebar.slider(
-    "Recent matches used",
-    min_value=3,
-    max_value=20,
-    value=DEFAULT_HISTORY_MATCHES,
+refresh = st.sidebar.button(
+    "🔄 Refresh data",
+    use_container_width=True,
 )
 
-minimum_probability = st.sidebar.slider(
-    "Selection probability threshold",
-    min_value=0.50,
-    max_value=0.90,
-    value=0.60,
-    step=0.01,
-)
-
-max_goals = st.sidebar.slider(
-    "Maximum scoreline goals",
-    min_value=5,
-    max_value=10,
-    value=DEFAULT_MAX_GOALS,
-)
-
-run_backtest_matches = st.sidebar.slider(
-    "Backtest matches per league",
-    min_value=10,
-    max_value=100,
-    value=30,
-)
+if refresh:
+    st.cache_data.clear()
+    st.rerun()
 
 
 # ============================================================
-# HEADER
+# MAIN HEADER
 # ============================================================
 
-st.markdown(
-    '<div class="main-title">⚽ Football Prediction Platform</div>',
-    unsafe_allow_html=True,
-)
-
+st.title("⚽ Football Prediction Centre")
 st.markdown(
     """
-    <div class="subtitle">
-    Poisson-based football prediction dashboard powered by
-    Football-Data.org.
-    </div>
-    """,
-    unsafe_allow_html=True,
+    Analyse upcoming football fixtures using historical team
+    performance and a Poisson probability model.
+    """
 )
 
 st.info(
-    """
-    **Model note:** Predictions are statistical estimates based on
-    historical league data. They are not guarantees of match outcomes
-    or betting returns.
-    """
+    "Predictions are statistical estimates, not guarantees. "
+    "Football outcomes are uncertain, and this tool should not be "
+    "treated as financial or betting advice."
 )
 
 
 # ============================================================
-# API KEY CHECK
+# VALIDATION
 # ============================================================
 
-if not api_key:
-
+if not token:
     st.warning(
-        """
-        Enter your Football-Data.org API key in the sidebar,
-        or configure `FOOTBALL_DATA_API_KEY` in Streamlit secrets.
-        """
+        "Enter your Football-Data.org API token in the sidebar "
+        "or configure it in Streamlit secrets to begin."
     )
+    st.stop()
 
+if not selected_leagues:
+    st.warning("Select at least one competition.")
+    st.stop()
+
+if date_to < date_from:
+    st.error("Please correct the selected date range.")
     st.stop()
 
 
 # ============================================================
-# DATE RANGE
+# LOAD DATA
 # ============================================================
 
-today = datetime.now(
-    timezone.utc
-).date()
+all_league_data = {}
+all_match_frames = []
+league_errors = {}
 
-future_date = today + timedelta(
-    days=fixture_days
-)
-
-date_from = today.isoformat()
-date_to = future_date.isoformat()
-
-
-# ============================================================
-# LOAD FIXTURES
-# ============================================================
-
-all_upcoming_predictions = []
-
-errors = []
-
-with st.spinner(
-    "Loading fixtures and building predictions..."
-):
+with st.spinner("Loading football data..."):
 
     for league_name in selected_leagues:
-
-        competition_code = COMPETITIONS[
-            league_name
-        ]
+        competition_code = LEAGUES[league_name]
 
         try:
-
-            # ------------------------------------------------
-            # Upcoming fixtures
-            # ------------------------------------------------
-
-            upcoming_matches = (
-                get_competition_matches(
-                    competition_code,
-                    api_key,
-                    date_from=date_from,
-                    date_to=date_to,
-                )
+            matches = fetch_competition_matches(
+                competition_code,
+                token,
+                date_from=date_from.isoformat(),
+                date_to=date_to.isoformat(),
             )
 
-            # ------------------------------------------------
-            # Full current-season competition data
-            # ------------------------------------------------
-
-            competition_info = (
-                get_competition_info(
-                    competition_code,
-                    api_key,
-                )
+            # Fetch a wider range for historical team form.
+            historical_matches = fetch_competition_matches(
+                competition_code,
+                token,
             )
 
-            current_season = (
-                competition_info
-                .get("currentSeason", {})
-                .get("startDate")
+            current_df = records_to_dataframe(
+                matches,
+                league_name,
             )
 
-            season_year = None
-
-            if current_season:
-                season_year = int(
-                    str(current_season)[:4]
-                )
-
-            completed_matches = (
-                get_competition_matches(
-                    competition_code,
-                    api_key,
-                    season=season_year,
-                    status="FINISHED",
-                )
+            history_df = records_to_dataframe(
+                historical_matches,
+                league_name,
             )
 
-            # ------------------------------------------------
-            # Build prediction for every upcoming match
-            # ------------------------------------------------
+            all_league_data[league_name] = {
+                "current": current_df,
+                "history": history_df,
+            }
 
-            for match in upcoming_matches:
+            if not history_df.empty:
+                all_match_frames.append(history_df)
 
-                status = match.get(
-                    "status"
-                )
-
-                if status not in [
-                    "SCHEDULED",
-                    "TIMED",
-                    "POSTPONED",
-                ]:
-                    continue
-
-                try:
-
-                    prediction = predict_match(
-                        match,
-                        completed_matches,
-                        history_matches=history_matches,
-                        max_goals=max_goals,
-                        minimum_probability=minimum_probability,
-                    )
-
-                    all_upcoming_predictions.append(
-                        prediction
-                    )
-
-                except Exception as exc:
-
-                    errors.append(
-                        f"{league_name}: "
-                        f"{match_team_names(match)} - "
-                        f"{exc}"
-                    )
-
-        except Exception as exc:
-
-            errors.append(
-                f"{league_name}: {exc}"
-            )
+        except Exception as error:
+            league_errors[league_name] = str(error)
 
 
-# ============================================================
-# ERROR DISPLAY
-# ============================================================
-
-if errors:
-
+if league_errors:
     with st.expander(
-        f"⚠️ Data/API messages ({len(errors)})"
+        f"Data access notices ({len(league_errors)})",
+        expanded=True,
     ):
+        for league_name, error in league_errors.items():
+            st.warning(f"**{league_name}:** {error}")
 
-        for error in errors:
-            st.write(
-                f"- {error}"
-            )
+
+if not all_match_frames:
+    st.error(
+        "No competition data could be loaded. Check your API token, "
+        "subscription access, and internet connection."
+    )
+    st.stop()
+
+
+all_matches = pd.concat(
+    all_match_frames,
+    ignore_index=True,
+)
+
+all_finished = get_finished_matches(all_matches)
 
 
 # ============================================================
-# DASHBOARD METRICS
+# UPDATE HISTORY
 # ============================================================
 
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric(
-        "Fixtures",
-        len(all_upcoming_predictions),
-    )
-
-with col2:
-    st.metric(
-        "Leagues",
-        len(selected_leagues),
-    )
-
-with col3:
-    if all_upcoming_predictions:
-        avg_probability = np.mean(
-            [
-                p["best_probability"]
-                for p in all_upcoming_predictions
-            ]
-        )
-        st.metric(
-            "Avg. model probability",
-            f"{avg_probability:.1%}",
-        )
-    else:
-        st.metric(
-            "Avg. model probability",
-            "—",
-        )
-
-with col4:
-    high_confidence = sum(
-        1
-        for p in all_upcoming_predictions
-        if p["best_probability"] >= 0.70
-    )
-
-    st.metric(
-        "≥70% probability",
-        high_confidence,
-    )
+initialise_history()
+update_saved_results(all_matches)
 
 
 # ============================================================
-# TABS
+# BUILD UPCOMING PREDICTIONS
 # ============================================================
 
-tab_dashboard, tab_details, tab_history, tab_backtest, tab_model = st.tabs(
-    [
-        "📊 Predictions",
-        "🔎 Match Analysis",
-        "📝 Prediction History",
+upcoming_frames = []
+
+for league_name, league_data in all_league_data.items():
+    current_df = league_data["current"]
+
+    if not current_df.empty:
+        upcoming = get_upcoming_matches(current_df)
+
+        if not upcoming.empty:
+            upcoming_frames.append(upcoming)
+
+
+if upcoming_frames:
+    upcoming_matches = pd.concat(
+        upcoming_frames,
+        ignore_index=True,
+    )
+else:
+    upcoming_matches = pd.DataFrame()
+
+
+predictions = []
+
+if not upcoming_matches.empty:
+    with st.spinner("Generating match predictions..."):
+
+        for _, match in upcoming_matches.iterrows():
+            league_name = match["league"]
+
+            league_history = all_finished[
+                all_finished["league"] == league_name
+            ].copy()
+
+            try:
+                prediction = predict_match(
+                    match.to_dict(),
+                    league_history,
+                )
+
+                predictions.append(prediction)
+
+            except Exception as error:
+                st.warning(
+                    f"Could not predict "
+                    f"{match['home_team']} vs {match['away_team']}: {error}"
+                )
+
+
+# ============================================================
+# NAVIGATION
+# ============================================================
+
+tab_dashboard, tab_fixtures, tab_history, tab_backtest, tab_standings = (
+    st.tabs([
+        "📊 Dashboard",
+        "⚽ Fixtures & Predictions",
+        "🗂️ Prediction History",
         "🧪 Backtesting",
-        "🧠 Model",
-    ]
+        "🏆 Standings",
+    ])
 )
 
 
 # ============================================================
-# DASHBOARD TAB
+# DASHBOARD
 # ============================================================
 
 with tab_dashboard:
 
-    st.subheader(
-        "Upcoming Match Predictions"
+    st.subheader("Overview")
+
+    total_fixtures = len(upcoming_matches)
+    total_predictions = len(predictions)
+    total_leagues = len(all_league_data)
+
+    history = get_prediction_history()
+    accuracy = calculate_history_accuracy(history)
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("Selected Leagues", total_leagues)
+    col2.metric("Upcoming Fixtures", total_fixtures)
+    col3.metric("Predictions Generated", total_predictions)
+
+    if accuracy:
+        col4.metric(
+            "Settled 1X2 Accuracy",
+            percent(accuracy["accuracy"]),
+        )
+    else:
+        col4.metric("Settled 1X2 Accuracy", "N/A")
+
+    st.markdown("---")
+
+    st.subheader("Competition Data Status")
+
+    status_rows = []
+
+    for league_name, league_data in all_league_data.items():
+        history_df = league_data["history"]
+        current_df = league_data["current"]
+
+        status_rows.append({
+            "Competition": league_name,
+            "Historical Matches": len(get_finished_matches(history_df)),
+            "Fixtures in Selected Window": len(current_df),
+            "Access": "Available",
+        })
+
+    for league_name, error in league_errors.items():
+        status_rows.append({
+            "Competition": league_name,
+            "Historical Matches": 0,
+            "Fixtures in Selected Window": 0,
+            "Access": "Unavailable",
+        })
+
+    st.dataframe(
+        pd.DataFrame(status_rows),
+        use_container_width=True,
+        hide_index=True,
     )
 
-    if not all_upcoming_predictions:
+    if predictions:
+        st.markdown("---")
+        st.subheader("Upcoming Fixtures")
 
-        st.warning(
-            "No upcoming fixtures were found for the selected leagues and date range."
+        overview_df = pd.DataFrame(
+            [prediction_to_row(p) for p in predictions]
         )
-
-    else:
-
-        dashboard_rows = []
-
-        for prediction in all_upcoming_predictions:
-
-            markets = prediction[
-                "markets"
-            ]
-
-            dashboard_rows.append(
-                {
-                    "League": prediction[
-                        "competition"
-                    ],
-
-                    "Date": prediction[
-                        "date"
-                    ].strftime(
-                        "%Y-%m-%d %H:%M UTC"
-                    ),
-
-                    "Home": prediction[
-                        "home_team"
-                    ],
-
-                    "Away": prediction[
-                        "away_team"
-                    ],
-
-                    "Home xG": round(
-                        prediction[
-                            "home_xg"
-                        ],
-                        2,
-                    ),
-
-                    "Away xG": round(
-                        prediction[
-                            "away_xg"
-                        ],
-                        2,
-                    ),
-
-                    "Home Win": markets[
-                        "Home Win"
-                    ],
-
-                    "Draw": markets[
-                        "Draw"
-                    ],
-
-                    "Away Win": markets[
-                        "Away Win"
-                    ],
-
-                    "Over 2.5": markets[
-                        "Over 2.5"
-                    ],
-
-                    "BTTS": markets[
-                        "BTTS Yes"
-                    ],
-
-                    "Model Selection": prediction[
-                        "best_market"
-                    ],
-
-                    "Probability": prediction[
-                        "best_probability"
-                    ],
-
-                    "Confidence": prediction[
-                        "confidence"
-                    ],
-                }
-            )
-
-        dashboard_df = pd.DataFrame(
-            dashboard_rows
-        )
-
-        percent_columns = [
-            "Home Win",
-            "Draw",
-            "Away Win",
-            "Over 2.5",
-            "BTTS",
-            "Probability",
-        ]
-
-        for column in percent_columns:
-            dashboard_df[column] = (
-                dashboard_df[column]
-                .astype(float)
-                .map(
-                    lambda x: f"{x:.1%}"
-                )
-            )
 
         st.dataframe(
-            dashboard_df,
+            overview_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info(
+            "No upcoming fixtures were found in the selected date range."
+        )
+
+
+# ============================================================
+# FIXTURES AND PREDICTIONS
+# ============================================================
+
+with tab_fixtures:
+
+    st.subheader("Fixtures & Predictions")
+
+    if not predictions:
+        st.info(
+            "No predictions are available for the selected date range."
+        )
+    else:
+        league_filter = st.selectbox(
+            "Filter by competition",
+            ["All Competitions"] + selected_leagues,
+        )
+
+        filtered_predictions = predictions
+
+        if league_filter != "All Competitions":
+            filtered_predictions = [
+                p for p in predictions
+                if p["league"] == league_filter
+            ]
+
+        prediction_df = pd.DataFrame(
+            [prediction_to_row(p) for p in filtered_predictions]
+        )
+
+        st.dataframe(
+            prediction_df,
             use_container_width=True,
             hide_index=True,
         )
 
+        st.download_button(
+            "⬇️ Download predictions as CSV",
+            data=prediction_df.to_csv(index=False).encode("utf-8"),
+            file_name="football_predictions.csv",
+            mime="text/csv",
+        )
+
+        st.markdown("---")
+        st.subheader("Detailed Match Analysis")
+
+        match_options = {
+            (
+                f"{p['date']} | {p['home_team']} vs {p['away_team']} "
+                f"({p['league']})"
+            ): p
+            for p in filtered_predictions
+        }
+
+        selected_match_label = st.selectbox(
+            "Select a match",
+            list(match_options.keys()),
+        )
+
+        selected_prediction = match_options[selected_match_label]
+
+        home = selected_prediction["home_team"]
+        away = selected_prediction["away_team"]
+
+        st.markdown(f"### {home} vs {away}")
+
+        home_col, draw_col, away_col = st.columns(3)
+
+        home_col.metric(
+            f"{home} Win",
+            percent(selected_prediction["home_win"]),
+        )
+
+        draw_col.metric(
+            "Draw",
+            percent(selected_prediction["draw"]),
+        )
+
+        away_col.metric(
+            f"{away} Win",
+            percent(selected_prediction["away_win"]),
+        )
+
+        st.markdown("---")
+
+        goal_col1, goal_col2 = st.columns(2)
+
+        goal_col1.metric(
+            "Expected Home Goals",
+            f"{selected_prediction['home_expected_goals']:.2f}",
+        )
+
+        goal_col2.metric(
+            "Expected Away Goals",
+            f"{selected_prediction['away_expected_goals']:.2f}",
+        )
+
         st.markdown(
-            "### Probability overview"
+            f"**Most likely exact score:** "
+            f"{selected_prediction['most_likely_score'][0]} - "
+            f"{selected_prediction['most_likely_score'][1]}"
         )
 
-        chart_df = pd.DataFrame(
-            [
-                {
-                    "Match": (
-                        f"{p['home_team']} "
-                        f"vs "
-                        f"{p['away_team']}"
-                    ),
-                    "Home Win": p[
-                        "markets"
-                    ]["Home Win"],
-                    "Draw": p[
-                        "markets"
-                    ]["Draw"],
-                    "Away Win": p[
-                        "markets"
-                    ]["Away Win"],
-                }
-                for p in all_upcoming_predictions
-            ]
+        st.markdown("---")
+        st.subheader("Goal Markets")
+
+        market_data = pd.DataFrame({
+            "Market": [
+                "Over 1.5 Goals",
+                "Over 2.5 Goals",
+                "Under 2.5 Goals",
+                "Over 3.5 Goals",
+                "Both Teams to Score — Yes",
+                "Both Teams to Score — No",
+            ],
+            "Estimated Probability": [
+                selected_prediction["over_15"],
+                selected_prediction["over_25"],
+                selected_prediction["under_25"],
+                selected_prediction["over_35"],
+                selected_prediction["btts_yes"],
+                selected_prediction["btts_no"],
+            ],
+        })
+
+        market_data["Estimated Probability"] = (
+            market_data["Estimated Probability"].apply(percent)
         )
 
-        if not chart_df.empty:
+        st.dataframe(
+            market_data,
+            use_container_width=True,
+            hide_index=True,
+        )
 
-            melted = chart_df.melt(
-                id_vars="Match",
-                var_name="Market",
-                value_name="Probability",
-            )
-
-            fig = px.bar(
-                melted,
-                x="Match",
-                y="Probability",
-                color="Market",
-                barmode="group",
-                title="1X2 probability comparison",
-            )
-
-            fig.update_yaxes(
-                tickformat=".0%",
-                range=[0, 1],
-            )
-
-            fig.update_layout(
-                xaxis_tickangle=-45
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-            )
-
-        # ----------------------------------------------------
-        # Save predictions
-        # ----------------------------------------------------
+        st.caption(
+            "The model uses league scoring averages and historical team "
+            "performance. It does not account for every factor, such as "
+            "injuries, suspensions, lineups, tactical changes, or weather."
+        )
 
         if st.button(
-            "💾 Save current predictions",
-            type="primary",
+            "💾 Save these predictions to history",
+            use_container_width=True,
         ):
-
-            rows = [
-                create_prediction_history_row(
-                    p
-                )
-                for p in all_upcoming_predictions
-            ]
-
-            save_prediction_history(
-                rows
-            )
-
-            st.success(
-                f"Saved {len(rows)} predictions to prediction_history.csv"
-            )
+            save_predictions(filtered_predictions)
+            st.success("Predictions saved to your session history.")
 
 
 # ============================================================
-# MATCH DETAILS TAB
-# ============================================================
-
-with tab_details:
-
-    st.subheader(
-        "Detailed Match Analysis"
-    )
-
-    if not all_upcoming_predictions:
-
-        st.info(
-            "No matches are available for detailed analysis."
-        )
-
-    else:
-
-        match_labels = [
-            (
-                f"{p['competition']} — "
-                f"{p['home_team']} vs "
-                f"{p['away_team']}"
-            )
-            for p in all_upcoming_predictions
-        ]
-
-        selected_index = st.selectbox(
-            "Select a match",
-            range(
-                len(match_labels)
-            ),
-            format_func=lambda i: match_labels[i],
-        )
-
-        prediction = (
-            all_upcoming_predictions[
-                selected_index
-            ]
-        )
-
-        st.markdown(
-            f"## {prediction['home_team']} "
-            f"vs "
-            f"{prediction['away_team']}"
-        )
-
-        st.caption(
-            f"{prediction['competition']} • "
-            f"{prediction['date'].strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-
-        # ----------------------------------------------------
-        # Expected goals
-        # ----------------------------------------------------
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            st.metric(
-                "Home xG",
-                f"{prediction['home_xg']:.2f}",
-            )
-
-        with c2:
-            st.metric(
-                "Away xG",
-                f"{prediction['away_xg']:.2f}",
-            )
-
-        with c3:
-            st.metric(
-                "Total xG",
-                f"{prediction['home_xg'] + prediction['away_xg']:.2f}",
-            )
-
-        # ----------------------------------------------------
-        # Main model selection
-        # ----------------------------------------------------
-
-        st.markdown(
-            "### Model selection"
-        )
-
-        st.success(
-            f"""
-            **{prediction['best_market']}**
-
-            Estimated probability:
-            **{prediction['best_probability']:.1%}**
-
-            Confidence category:
-            **{prediction['confidence']}**
-            """
-        )
-
-        st.caption(
-            "This is the highest-probability selection produced by the configured statistical model. It is not a guaranteed outcome."
-        )
-
-        # ----------------------------------------------------
-        # 1X2
-        # ----------------------------------------------------
-
-        st.markdown(
-            "### 1X2 probabilities"
-        )
-
-        one_x_two = pd.DataFrame(
-            {
-                "Outcome": [
-                    "Home Win",
-                    "Draw",
-                    "Away Win",
-                ],
-                "Probability": [
-                    prediction["markets"][
-                        "Home Win"
-                    ],
-                    prediction["markets"][
-                        "Draw"
-                    ],
-                    prediction["markets"][
-                        "Away Win"
-                    ],
-                ],
-            }
-        )
-
-        one_x_two["Probability"] = (
-            one_x_two["Probability"]
-            .map(
-                lambda x: f"{x:.2%}"
-            )
-        )
-
-        st.dataframe(
-            one_x_two,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ----------------------------------------------------
-        # Scoreline heatmap
-        # ----------------------------------------------------
-
-        st.markdown(
-            "### Correct-score probability matrix"
-        )
-
-        matrix = prediction[
-            "matrix"
-        ]
-
-        score_labels = [
-            str(i)
-            for i in range(
-                max_goals + 1
-            )
-        ]
-
-        heatmap = go.Figure(
-            data=go.Heatmap(
-                z=matrix,
-                x=score_labels,
-                y=score_labels,
-                text=[
-                    [
-                        f"{value:.1%}"
-                        for value in row
-                    ]
-                    for row in matrix
-                ],
-                texttemplate="%{text}",
-                hovertemplate=(
-                    "Home goals: %{y}"
-                    "<br>Away goals: %{x}"
-                    "<br>Probability: %{z:.2%}"
-                    "<extra></extra>"
-                ),
-            )
-        )
-
-        heatmap.update_layout(
-            xaxis_title="Away goals",
-            yaxis_title="Home goals",
-            title="Poisson scoreline matrix",
-        )
-
-        st.plotly_chart(
-            heatmap,
-            use_container_width=True,
-        )
-
-        # ----------------------------------------------------
-        # Top correct scores
-        # ----------------------------------------------------
-
-        st.markdown(
-            "### Most probable correct scores"
-        )
-
-        score_df = pd.DataFrame(
-            [
-                {
-                    "Correct Score": x[
-                        "score"
-                    ],
-                    "Probability": (
-                        f"{x['probability']:.2%}"
-                    ),
-                }
-                for x in prediction[
-                    "top_scores"
-                ]
-            ]
-        )
-
-        st.dataframe(
-            score_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ----------------------------------------------------
-        # All markets
-        # ----------------------------------------------------
-
-        st.markdown(
-            "### Full market probabilities"
-        )
-
-        market_rows = []
-
-        for market, probability in prediction[
-            "markets"
-        ].items():
-
-            market_rows.append(
-                {
-                    "Market": market,
-                    "Probability": probability,
-                    "Probability Display": (
-                        f"{probability:.2%}"
-                    ),
-                }
-            )
-
-        market_df = pd.DataFrame(
-            market_rows
-        )
-
-        market_df = market_df.sort_values(
-            "Probability",
-            ascending=False,
-        )
-
-        st.dataframe(
-            market_df[
-                [
-                    "Market",
-                    "Probability Display",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ----------------------------------------------------
-        # Team form
-        # ----------------------------------------------------
-
-        st.markdown(
-            "### Recent team form"
-        )
-
-        form1, form2 = st.columns(2)
-
-        with form1:
-
-            st.markdown(
-                f"#### {prediction['home_team']}"
-            )
-
-            home_history_df = pd.DataFrame(
-                prediction[
-                    "home_history"
-                ]
-            )
-
-            if not home_history_df.empty:
-
-                display_cols = [
-                    "date",
-                    "home_team",
-                    "away_team",
-                    "goals_for",
-                    "goals_against",
-                    "venue",
-                    "result",
-                ]
-
-                st.dataframe(
-                    home_history_df[
-                        display_cols
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-        with form2:
-
-            st.markdown(
-                f"#### {prediction['away_team']}"
-            )
-
-            away_history_df = pd.DataFrame(
-                prediction[
-                    "away_history"
-                ]
-            )
-
-            if not away_history_df.empty:
-
-                display_cols = [
-                    "date",
-                    "home_team",
-                    "away_team",
-                    "goals_for",
-                    "goals_against",
-                    "venue",
-                    "result",
-                ]
-
-                st.dataframe(
-                    away_history_df[
-                        display_cols
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-
-# ============================================================
-# PREDICTION HISTORY TAB
+# PREDICTION HISTORY
 # ============================================================
 
 with tab_history:
 
-    st.subheader(
-        "Prediction History"
-    )
+    st.subheader("Prediction History")
 
-    history_df = load_prediction_history()
+    history = get_prediction_history()
 
-    if history_df.empty:
-
+    if not history:
         st.info(
-            "No saved predictions yet. Use the Save Current Predictions button on the Predictions tab."
+            "No predictions have been saved yet. "
+            "Use the Fixtures & Predictions tab to save predictions."
         )
-
     else:
+        history_rows = []
 
-        if st.button(
-            "🔄 Update completed results"
-        ):
+        for item in history:
+            home_score = item.get("actual_home_score")
+            away_score = item.get("actual_away_score")
 
-            with st.spinner(
-                "Checking completed matches..."
-            ):
+            if item.get("result_checked"):
+                actual_score = f"{home_score} - {away_score}"
+            else:
+                actual_score = "Pending"
 
-                history_df = (
-                    update_prediction_results(
-                        history_df,
-                        api_key,
-                    )
-                )
+            history_rows.append({
+                "Date": item["date"],
+                "League": item["league"],
+                "Home Team": item["home_team"],
+                "Away Team": item["away_team"],
+                "Predicted Score": (
+                    f"{item['most_likely_score'][0]} - "
+                    f"{item['most_likely_score'][1]}"
+                ),
+                "Actual Score": actual_score,
+                "Home Win": percent(item["home_win"]),
+                "Draw": percent(item["draw"]),
+                "Away Win": percent(item["away_win"]),
+            })
 
-            st.success(
-                "Prediction results updated."
-            )
-
-        # ----------------------------------------------------
-        # Statistics
-        # ----------------------------------------------------
-
-        resolved = history_df[
-            history_df[
-                "result_correct"
-            ].isin(
-                ["WIN", "LOSS"]
-            )
-        ]
-
-        if not resolved.empty:
-
-            wins = (
-                resolved[
-                    "result_correct"
-                ]
-                == "WIN"
-            ).sum()
-
-            losses = (
-                resolved[
-                    "result_correct"
-                ]
-                == "LOSS"
-            ).sum()
-
-            total = wins + losses
-
-            accuracy = (
-                wins / total
-                if total
-                else 0
-            )
-
-            h1, h2, h3 = st.columns(3)
-
-            with h1:
-                st.metric(
-                    "Resolved predictions",
-                    total,
-                )
-
-            with h2:
-                st.metric(
-                    "Correct",
-                    wins,
-                )
-
-            with h3:
-                st.metric(
-                    "Historical accuracy",
-                    f"{accuracy:.1%}",
-                )
+        history_df = pd.DataFrame(history_rows)
 
         st.dataframe(
             history_df,
@@ -2566,15 +1346,35 @@ with tab_history:
             hide_index=True,
         )
 
-        csv_data = history_df.to_csv(
-            index=False
-        )
-
         st.download_button(
-            "⬇️ Download prediction history CSV",
-            data=csv_data,
+            "⬇️ Download history as CSV",
+            data=history_df.to_csv(index=False).encode("utf-8"),
             file_name="prediction_history.csv",
             mime="text/csv",
+        )
+
+        accuracy = calculate_history_accuracy(history)
+
+        if accuracy:
+            st.markdown("---")
+            st.subheader("Settled Prediction Performance")
+
+            metric1, metric2, metric3 = st.columns(3)
+
+            metric1.metric("Settled Matches", accuracy["settled"])
+            metric2.metric("Correct 1X2 Predictions", accuracy["correct"])
+            metric3.metric(
+                "1X2 Accuracy",
+                percent(accuracy["accuracy"]),
+            )
+
+        if st.button("Clear session prediction history"):
+            st.session_state[HISTORY_KEY] = []
+            st.rerun()
+
+        st.caption(
+            "History is stored in the current Streamlit session. "
+            "It may be lost when the session resets or the app restarts."
         )
 
 
@@ -2584,628 +1384,160 @@ with tab_history:
 
 with tab_backtest:
 
-    st.subheader(
-        "Historical Backtesting"
-    )
+    st.subheader("Historical Backtesting")
 
     st.write(
-        """
-        Backtesting runs the same prediction logic against historical
-        matches. For each historical fixture, only matches that occurred
-        before that fixture are used to build the prediction. This helps
-        reduce future-data leakage.
-        """
+        "Backtesting evaluates how the model would have performed on "
+        "past matches. Each historical prediction is generated using "
+        "only matches played before the target fixture."
     )
 
-    st.warning(
-        """
-        Backtesting is computationally heavier and can consume more
-        Football-Data.org API/data resources. Start with a smaller number
-        of matches when testing.
-        """
+    backtest_league = st.selectbox(
+        "Competition to backtest",
+        selected_leagues,
+        key="backtest_league",
     )
 
-    if st.button(
-        "🧪 Run full backtest",
-        type="primary",
-    ):
+    backtest_history = all_league_data[backtest_league]["history"]
+    backtest_finished = get_finished_matches(backtest_history)
 
-        all_backtest_rows = []
-
-        progress = st.progress(
-            0
+    if backtest_finished.empty:
+        st.info("No finished matches are available for this competition.")
+    else:
+        st.caption(
+            f"{len(backtest_finished)} finished matches are available "
+            "in the retrieved dataset."
         )
 
-        total_leagues = len(
-            selected_leagues
-        )
-
-        for league_number, league_name in enumerate(
-            selected_leagues,
-            start=1,
+        if st.button(
+            "Run backtest",
+            use_container_width=True,
         ):
-
-            competition_code = COMPETITIONS[
-                league_name
-            ]
-
-            try:
-
-                competition_info = (
-                    get_competition_info(
-                        competition_code,
-                        api_key,
-                    )
+            with st.spinner(
+                "Running historical simulations. This may take a while..."
+            ):
+                backtest_results = backtest_matches(
+                    backtest_finished,
+                    minimum_history=minimum_history,
                 )
 
-                current_season = (
-                    competition_info
-                    .get("currentSeason", {})
-                    .get("startDate")
+            st.session_state["backtest_results"] = backtest_results
+
+        if "backtest_results" in st.session_state:
+            results = st.session_state["backtest_results"]
+
+            if results.empty:
+                st.warning(
+                    "Not enough historical matches to run the backtest. "
+                    "Try reducing the minimum historical matches setting."
                 )
+            else:
+                total = len(results)
+                correct = int(results["Correct"].sum())
+                accuracy_value = correct / total
 
-                if current_season:
+                b1, b2, b3 = st.columns(3)
 
-                    season_year = int(
-                        str(
-                            current_season
-                        )[:4]
-                    )
+                b1.metric("Matches Evaluated", total)
+                b2.metric("Correct 1X2 Predictions", correct)
+                b3.metric("Historical 1X2 Accuracy", percent(accuracy_value))
 
-                else:
+                st.markdown("---")
 
-                    season_year = None
-
-                all_matches = (
-                    get_competition_matches(
-                        competition_code,
-                        api_key,
-                        season=season_year,
-                    )
-                )
-
-                historical_matches = [
-                    m
-                    for m in all_matches
-                    if is_finished(m)
-                ]
-
-                historical_matches = sorted(
-                    historical_matches,
-                    key=lambda m: (
-                        parse_match_date(m)
+                st.dataframe(
+                    results.drop(
+                        columns=[
+                            "Home Probability",
+                            "Draw Probability",
+                            "Away Probability",
+                        ],
+                        errors="ignore",
                     ),
+                    use_container_width=True,
+                    hide_index=True,
                 )
 
-                # ------------------------------------------------
-                # Use the most recent N matches.
-                # ------------------------------------------------
-
-                historical_matches = (
-                    historical_matches[
-                        -run_backtest_matches:
-                    ]
+                st.download_button(
+                    "⬇️ Download backtest results",
+                    data=results.to_csv(index=False).encode("utf-8"),
+                    file_name="football_backtest.csv",
+                    mime="text/csv",
                 )
 
-                for match in historical_matches:
-
-                    try:
-
-                        prediction = predict_match(
-                            match,
-                            all_matches,
-                            history_matches=history_matches,
-                            max_goals=max_goals,
-                            minimum_probability=minimum_probability,
-                        )
-
-                        score = get_full_time_score(
-                            match
-                        )
-
-                        if score is None:
-                            continue
-
-                        actual_home, actual_away = (
-                            score
-                        )
-
-                        # ------------------------------------------------
-                        # 1X2 actual outcome
-                        # ------------------------------------------------
-
-                        if actual_home > actual_away:
-                            actual_1x2 = (
-                                "Home Win"
-                            )
-
-                        elif actual_home == actual_away:
-                            actual_1x2 = (
-                                "Draw"
-                            )
-
-                        else:
-                            actual_1x2 = (
-                                "Away Win"
-                            )
-
-                        predicted_probs = {
-                            "Home Win": prediction[
-                                "markets"
-                            ]["Home Win"],
-
-                            "Draw": prediction[
-                                "markets"
-                            ]["Draw"],
-
-                            "Away Win": prediction[
-                                "markets"
-                            ]["Away Win"],
-                        }
-
-                        predicted_1x2 = max(
-                            predicted_probs,
-                            key=predicted_probs.get,
-                        )
-
-                        all_backtest_rows.append(
-                            {
-                                "League": league_name,
-                                "Date": parse_match_date(
-                                    match
-                                ),
-                                "Home": prediction[
-                                    "home_team"
-                                ],
-                                "Away": prediction[
-                                    "away_team"
-                                ],
-                                "Actual Score": (
-                                    f"{actual_home}-{actual_away}"
-                                ),
-                                "Predicted 1X2": predicted_1x2,
-                                "Actual 1X2": actual_1x2,
-                                "1X2 Correct": (
-                                    predicted_1x2
-                                    == actual_1x2
-                                ),
-                                "Home Win Prob": predicted_probs[
-                                    "Home Win"
-                                ],
-                                "Draw Prob": predicted_probs[
-                                    "Draw"
-                                ],
-                                "Away Win Prob": predicted_probs[
-                                    "Away Win"
-                                ],
-                                "Best Market": prediction[
-                                    "best_market"
-                                ],
-                                "Best Market Prob": prediction[
-                                    "best_probability"
-                                ],
-                            }
-                        )
-
-                    except Exception as exc:
-
-                        errors.append(
-                            f"Backtest {league_name}: {exc}"
-                        )
-
-            except Exception as exc:
-
-                st.error(
-                    f"Could not backtest {league_name}: {exc}"
+                st.caption(
+                    "Backtest results describe performance on the retrieved "
+                    "historical sample. They do not guarantee future accuracy."
                 )
 
-            progress.progress(
-                league_number
-                / total_leagues
+
+# ============================================================
+# STANDINGS
+# ============================================================
+
+with tab_standings:
+
+    st.subheader("League Standings")
+
+    standings_league = st.selectbox(
+        "Select competition",
+        selected_leagues,
+        key="standings_league",
+    )
+
+    standings_code = LEAGUES[standings_league]
+
+    try:
+        standings = fetch_competition_standings(
+            standings_code,
+            token,
+        )
+
+        if not standings:
+            st.info(
+                "Standings are not available for this competition or "
+                "are not supported by the current API response."
             )
-
-        progress.empty()
-
-        if all_backtest_rows:
-
-            backtest_df = pd.DataFrame(
-                all_backtest_rows
-            )
-
-            # ----------------------------------------------------
-            # Accuracy
-            # ----------------------------------------------------
-
-            accuracy = (
-                backtest_df[
-                    "1X2 Correct"
-                ].mean()
-            )
-
-            # ----------------------------------------------------
-            # Multi-class Brier score
-            # ----------------------------------------------------
-
-            brier_values = []
-
-            log_loss_values = []
-
-            for _, row in backtest_df.iterrows():
-
-                outcome = row[
-                    "Actual 1X2"
-                ]
-
-                probs = [
-                    row[
-                        "Home Win Prob"
-                    ],
-                    row[
-                        "Draw Prob"
-                    ],
-                    row[
-                        "Away Win Prob"
-                    ],
-                ]
-
-                classes = [
-                    "Home Win",
-                    "Draw",
-                    "Away Win",
-                ]
-
-                one_hot = [
-                    1 if outcome == c
-                    else 0
-                    for c in classes
-                ]
-
-                brier = np.mean(
-                    [
-                        (
-                            probs[i]
-                            - one_hot[i]
-                        ) ** 2
-                        for i in range(3)
-                    ]
-                )
-
-                brier_values.append(
-                    brier
-                )
-
-                actual_index = (
-                    classes.index(
-                        outcome
-                    )
-                )
-
-                probability = np.clip(
-                    probs[actual_index],
-                    1e-15,
-                    1 - 1e-15,
-                )
-
-                log_loss_values.append(
-                    -math.log(
-                        probability
-                    )
-                )
-
-            brier = float(
-                np.mean(
-                    brier_values
-                )
-            )
-
-            multiclass_log_loss = float(
-                np.mean(
-                    log_loss_values
-                )
-            )
-
-            # ----------------------------------------------------
-            # Metrics
-            # ----------------------------------------------------
-
-            b1, b2, b3 = st.columns(3)
-
-            with b1:
-                st.metric(
-                    "1X2 Accuracy",
-                    f"{accuracy:.1%}",
-                )
-
-            with b2:
-                st.metric(
-                    "Brier Score",
-                    f"{brier:.4f}",
-                )
-
-            with b3:
-                st.metric(
-                    "Log Loss",
-                    f"{multiclass_log_loss:.4f}",
-                )
-
-            st.caption(
-                "For Brier score and log loss, lower values indicate better probabilistic calibration."
-            )
-
-            # ----------------------------------------------------
-            # League performance
-            # ----------------------------------------------------
-
-            league_results = (
-                backtest_df
-                .groupby("League")
-                ["1X2 Correct"]
-                .mean()
-                .reset_index()
-            )
-
-            league_results[
-                "Accuracy"
-            ] = league_results[
-                "1X2 Correct"
-            ].map(
-                lambda x: f"{x:.1%}"
-            )
-
-            st.markdown(
-                "### Accuracy by league"
-            )
-
-            st.dataframe(
-                league_results[
-                    [
-                        "League",
-                        "Accuracy",
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            # ----------------------------------------------------
-            # Results chart
-            # ----------------------------------------------------
-
-            chart = px.bar(
-                league_results,
-                x="League",
-                y="1X2 Correct",
-                title="Historical 1X2 accuracy by league",
-            )
-
-            chart.update_yaxes(
-                tickformat=".0%",
-                range=[0, 1],
-            )
-
-            st.plotly_chart(
-                chart,
-                use_container_width=True,
-            )
-
-            # ----------------------------------------------------
-            # Detailed backtest
-            # ----------------------------------------------------
-
-            st.markdown(
-                "### Backtest results"
-            )
-
-            display_backtest = backtest_df.copy()
-
-            for col in [
-                "Home Win Prob",
-                "Draw Prob",
-                "Away Win Prob",
-                "Best Market Prob",
-            ]:
-
-                display_backtest[
-                    col
-                ] = display_backtest[
-                    col
-                ].map(
-                    lambda x: f"{x:.1%}"
-                )
-
-            st.dataframe(
-                display_backtest,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            csv = backtest_df.to_csv(
-                index=False
-            )
-
-            st.download_button(
-                "⬇️ Download backtest results",
-                data=csv,
-                file_name="football_backtest.csv",
-                mime="text/csv",
-            )
-
         else:
+            for table in standings:
+                table_type = table.get("type", "TABLE")
+                group = table.get("group")
 
-            st.warning(
-                "No backtest results were generated."
-            )
+                title = table_type
 
+                if group:
+                    title = f"{title} — {group}"
 
-# ============================================================
-# MODEL TAB
-# ============================================================
+                st.markdown(f"### {title}")
 
-with tab_model:
+                rows = []
 
-    st.subheader(
-        "🧠 How the prediction model works"
-    )
+                for entry in table.get("table", []):
+                    team = entry.get("team", {})
 
-    st.markdown(
-        """
-        ### 1. Data collection
+                    rows.append({
+                        "Position": entry.get("position"),
+                        "Team": team.get("name"),
+                        "Played": entry.get("playedGames"),
+                        "Won": entry.get("won"),
+                        "Drawn": entry.get("draw"),
+                        "Lost": entry.get("lost"),
+                        "Goals For": entry.get("goalsFor"),
+                        "Goals Against": entry.get("goalsAgainst"),
+                        "Goal Difference": entry.get("goalDifference"),
+                        "Points": entry.get("points"),
+                    })
 
-        The application retrieves football fixtures and historical
-        league results from Football-Data.org.
+                if rows:
+                    st.dataframe(
+                        pd.DataFrame(rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-        The three configured competitions are:
-
-        - Premier League — `PL`
-        - La Liga — `PD`
-        - Serie A — `SA`
-
-        ### 2. Historical form
-
-        For each upcoming match, the application examines the recent
-        completed matches of both teams.
-
-        It considers:
-
-        - goals scored
-        - goals conceded
-        - home performance
-        - away performance
-        - recent results
-
-        More recent matches receive greater weight.
-
-        ### 3. Expected goals
-
-        The model combines the attacking performance of one team with
-        the defensive performance of its opponent.
-
-        It also applies league-level smoothing so that a small number
-        of recent matches does not completely dominate the calculation.
-
-        ### 4. Poisson distribution
-
-        Expected goals are converted into probabilities for possible
-        scorelines.
-
-        For example:
-
-        `0-0`
-
-        `1-0`
-
-        `1-1`
-
-        `2-1`
-
-        `2-2`
-
-        etc.
-
-        The probability of each scoreline is then used to calculate
-        the different markets.
-
-        ### 5. Market probabilities
-
-        The scoreline matrix is aggregated into:
-
-        - Home Win
-        - Draw
-        - Away Win
-        - Double Chance
-        - Draw No Bet
-        - Over/Under goals
-        - BTTS
-        - Team goal totals
-        - BTTS + Result
-        - Correct Score
-
-        ### 6. Backtesting
-
-        Historical matches can be tested using the same prediction
-        methodology.
-
-        The application reports:
-
-        - Accuracy
-        - Brier score
-        - Log loss
-
-        Importantly, the historical prediction process only uses
-        matches that occurred before the target fixture.
-
-        ### 7. Important limitations
-
-        This is a statistical model.
-
-        It does not currently directly model every factor that can
-        influence a football match, such as:
-
-        - injuries
-        - confirmed starting lineups
-        - suspensions
-        - managerial changes
-        - tactical changes
-        - weather
-        - travel
-        - motivation
-        - bookmaker odds
-        - market movement
-
-        Therefore, a high model probability should never be interpreted
-        as certainty.
-        """
-    )
-
-    st.markdown(
-        "### API configuration"
-    )
-
-    st.code(
-        """
-# Streamlit secrets
-
-FOOTBALL_DATA_API_KEY = "YOUR_API_KEY_HERE"
-        """.strip(),
-        language="toml",
-    )
-
-    st.markdown(
-        "### Required Python packages"
-    )
-
-    st.code(
-        """
-streamlit
-requests
-pandas
-numpy
-scipy
-plotly
-        """.strip(),
-        language="text",
-    )
-
-    st.markdown(
-        "### Data source"
-    )
-
-    st.write(
-        "Football-Data.org API v4"
-    )
-
-    st.markdown(
-        "### Responsible-use note"
-    )
-
-    st.warning(
-        """
-        Football outcomes are inherently uncertain. Statistical
-        probabilities are not guarantees. If this application is used
-        in connection with betting, use appropriate limits and treat
-        predictions as informational estimates rather than certainty.
-        """
-    )
+    except Exception as error:
+        st.warning(
+            f"Standings could not be loaded for {standings_league}: {error}"
+        )
 
 
 # ============================================================
@@ -3214,6 +1546,12 @@ plotly
 
 st.markdown("---")
 
-st.caption(
-    "Football Prediction Platform • Streamlit • Football-Data.org API • Poisson Statistical Model"
+st.markdown(
+    """
+    <div class="small-note">
+        Football Prediction Centre · Powered by Streamlit and
+        Football-Data.org API · Predictions are estimates only.
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
