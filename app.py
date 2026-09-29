@@ -5,9 +5,21 @@ Football Prediction Platform
 Streamlit + Football-Data.org API v4
 
 Supported competitions:
-    - Premier League (PL)
-    - La Liga (PD)
-    - Serie A (SA)
+    LEAGUES = {
+    "Premier League": "PL",
+    "Championship": "ELC",
+    "La Liga": "PD",
+    "Serie A": "SA",
+    "Bundesliga": "BL1",
+    "Ligue 1": "FL1",
+    "Eredivisie": "DED",
+    "Primeira Liga": "PPD",
+    "UEFA Champions League": "CL",
+    "Brasileirão Série A": "BSA",
+    "Euro Championship": "EC",
+    "FIFA World Cup": "WC"
+}
+
 
 Model:
     - Recent home/away performance
